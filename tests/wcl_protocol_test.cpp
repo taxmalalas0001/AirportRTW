@@ -57,6 +57,65 @@ int main()
     assert(decodeJoin(request, sizeof(request), join));
     assert(classifyLegacyAuth(join) == LegacyAuth::Invalid);
 
+    // Passphrases must work for every PSK AKM set airportd can request:
+    // WPA/WPA2 mixed mode and WPA2-PSK advertised together with PSK-SHA256.
+    request[0x44] = 12;
+    request[0x14] = 0x0a; // WPA_PSK | WPA2_PSK
+    assert(decodeJoin(request, sizeof(request), join));
+    assert(classifyLegacyAuth(join) == LegacyAuth::PersonalPassphrase);
+    request[0x14] = 0x08; request[0x15] = 0x04; // WPA2_PSK | SHA256_PSK
+    assert(decodeJoin(request, sizeof(request), join));
+    assert(classifyLegacyAuth(join) == LegacyAuth::PersonalPassphrase);
+    request[0x15] = 0x01; // unknown auth bit 8 stays invalid
+    assert(decodeJoin(request, sizeof(request), join));
+    assert(classifyLegacyAuth(join) == LegacyAuth::Invalid);
+    request[0x15] = 0x10; // WPA2_PSK | WPA3_SAE: transition, joins via WPA2-PSK
+    assert(decodeJoin(request, sizeof(request), join));
+    assert(classifyLegacyAuth(join) == LegacyAuth::PersonalPassphrase);
+    request[0x15] = 0x14; // WPA2_PSK | SHA256_PSK | WPA3_SAE
+    assert(decodeJoin(request, sizeof(request), join));
+    assert(classifyLegacyAuth(join) == LegacyAuth::PersonalPassphrase);
+    request[0x14] = 0x04; request[0x15] = 0x10; // WPA2 (802.1X) | WPA3_SAE
+    assert(decodeJoin(request, sizeof(request), join));
+    assert(classifyLegacyAuth(join) == LegacyAuth::Invalid);
+    request[0x14] = 0x08; request[0x15] = 0;
+
+    // Transition networks fall back to the PSK family even when the AP also
+    // advertises PSK-SHA256 or SAE-EXT-KEY. SAE-only stays untouched.
+    {
+        // RSN v1, group CCMP, 1x pairwise CCMP, AKMs {2,6,8}, caps MFPC.
+        uint8_t rsn[] = {48, 28, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4,
+                         3, 0, 0, 0x0f, 0xac, 2, 0, 0x0f, 0xac, 6, 0, 0x0f, 0xac, 8,
+                         0x80, 0};
+        size_t n = selectWPA2TransitionMode(rsn, sizeof(rsn));
+        assert(n == sizeof(rsn) - 4 && rsn[1] == 24 && rsn[14] == 2);
+        assert(rsn[19] == 2 && rsn[23] == 6 && rsn[24] == 0x80);
+        uint8_t ext[] = {48, 24, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4,
+                         2, 0, 0, 0x0f, 0xac, 2, 0, 0x0f, 0xac, 24, 0x80, 0};
+        n = selectWPA2TransitionMode(ext, sizeof(ext));
+        assert(n == sizeof(ext) - 4 && ext[1] == 20 && ext[14] == 1 && ext[19] == 2 && ext[20] == 0x80);
+        uint8_t saeOnly[] = {48, 24, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4,
+                             2, 0, 0, 0x0f, 0xac, 8, 0, 0x0f, 0xac, 24, 0xc0, 0};
+        assert(selectWPA2TransitionMode(saeOnly, sizeof(saeOnly)) == sizeof(saeOnly));
+    }
+    // A 64-digit hex PSK is the PMK itself; non-hex 64-byte input is invalid.
+    request[0x44] = 64;
+    memset(request + 0x50, 'a', 64);
+    assert(decodeJoin(request, sizeof(request), join));
+    assert(classifyLegacyAuth(join) == LegacyAuth::PersonalHexKey);
+    uint8_t pmk[32];
+    decodeHexKey(join.key, pmk, sizeof(pmk));
+    assert(pmk[0] == 0xaa && pmk[31] == 0xaa);
+    request[0x50 + 63] = 'z';
+    assert(decodeJoin(request, sizeof(request), join));
+    assert(classifyLegacyAuth(join) == LegacyAuth::Invalid);
+    // Mixing PSK and 802.1X AKMs stays invalid.
+    request[0x44] = 12; request[0x14] = 0x0c; // WPA2 | WPA2_PSK
+    assert(decodeJoin(request, sizeof(request), join));
+    assert(classifyLegacyAuth(join) == LegacyAuth::Invalid);
+    memset(request + 0x50, 'p', 64);
+    request[0x14] = 8; request[0x44] = 63;
+
     uint8_t channels[32] = {};
     channels[36 / 8] |= 1u << (36 % 8);
     assert(scanChannelSelected(channels, true, 36));

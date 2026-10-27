@@ -509,7 +509,8 @@ IOReturn AirportRTWSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
     auto auth = AirportWCL::classifyLegacyAuth(join);
     bool sae = auth == AirportWCL::LegacyAuth::SAE;
     bool passphrase = auth == AirportWCL::LegacyAuth::PersonalPassphrase;
-    bool personal = auth == AirportWCL::LegacyAuth::Personal || passphrase;
+    bool hexKey = auth == AirportWCL::LegacyAuth::PersonalHexKey;
+    bool personal = auth == AirportWCL::LegacyAuth::Personal || passphrase || hexKey;
     bool enterprise = auth == AirportWCL::LegacyAuth::Enterprise;
     bool supported = auth != AirportWCL::LegacyAuth::Invalid;
     ieee80211com *ic = fHalService->get80211Controller();
@@ -593,6 +594,8 @@ IOReturn AirportRTWSkywalkInterface::startWCLJoin(AirportWCL::JoinRequest &join)
                                         ic->ic_psk, sizeof(ic->ic_psk));
                 explicit_bzero(password, sizeof(password));
                 if (error) { explicit_bzero(&join, sizeof(join)); return kIOReturnError; }
+            } else if (hexKey) {
+                AirportWCL::decodeHexKey(join.key, ic->ic_psk, sizeof(ic->ic_psk));
             } else memcpy(ic->ic_psk, join.key, sizeof(ic->ic_psk));
             ic->ic_flags |= IEEE80211_F_PSK;
         } else if (join.keyLength == IEEE80211_PMK_LEN) {

@@ -358,30 +358,44 @@ inline size_t selectWPA2TransitionMode(uint8_t *ies, size_t length) {
             offset += size;
             continue;
         }
-        bool psk = false, sae = false, other = false;
+        // PSK family: PSK (2) and PSK-SHA256 (6). SAE family: SAE (8) and
+        // SAE-EXT-KEY (24). Routers commonly advertise PSK-SHA256 or
+        // SAE-EXT-KEY alongside the basic pair; those are still transition
+        // networks and must fall back to WPA2-PSK rather than reach WCL as
+        // a WPA3 network this frontend cannot join with combined AKMs.
+        bool psk = false, pskSha256 = false, sae = false, other = false;
         for (size_t i = 0; i < count; ++i) {
             const uint8_t *suite = ie + suitesOffset + 4 * i;
             if (suite[0] != 0 || suite[1] != 0x0f || suite[2] != 0xac)
                 other = true;
             else if (suite[3] == 2)
                 psk = true;
-            else if (suite[3] == 8)
+            else if (suite[3] == 6)
+                pskSha256 = true;
+            else if (suite[3] == 8 || suite[3] == 24)
                 sae = true;
             else
                 other = true;
         }
-        if (!psk || !sae || other) {
+        if (!(psk || pskSha256) || !sae || other) {
             offset += size;
             continue;
         }
-        const uint8_t pskSuite[] = {0, 0x0f, 0xac, 2};
-        memcpy(ie + suitesOffset, pskSuite, sizeof(pskSuite));
-        ie[countOffset] = 1;
+        size_t kept = 0;
+        if (psk) {
+            const uint8_t pskSuite[] = {0, 0x0f, 0xac, 2};
+            memcpy(ie + suitesOffset + 4 * kept++, pskSuite, sizeof(pskSuite));
+        }
+        if (pskSha256) {
+            const uint8_t pskSha256Suite[] = {0, 0x0f, 0xac, 6};
+            memcpy(ie + suitesOffset + 4 * kept++, pskSha256Suite, sizeof(pskSha256Suite));
+        }
+        ie[countOffset] = uint8_t(kept);
         ie[countOffset + 1] = 0;
-        size_t removed = 4 * (count - 1);
+        size_t removed = 4 * (count - kept);
         // Keep RSN capabilities, PMKIDs, group-management cipher and all
         // following information elements byte-for-byte intact.
-        memmove(ie + suitesOffset + 4, ie + tailOffset,
+        memmove(ie + suitesOffset + 4 * kept, ie + tailOffset,
                 length - offset - tailOffset);
         ie[1] -= removed;
         length -= removed;
@@ -469,7 +483,27 @@ inline bool validRSNOverride(const uint8_t *ie, size_t length) {
         ie[4] == 0xf2 && ie[5] == 1 && ie[6] == 1 && ie[7] == 0;
 }
 
-enum class LegacyAuth { Invalid, Open, Wep, Personal, Enterprise, SAE, PersonalPassphrase };
+enum class LegacyAuth { Invalid, Open, Wep, Personal, Enterprise, SAE, PersonalPassphrase, PersonalHexKey };
+
+inline int hexNibble(uint8_t c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+inline bool isHexKey(const uint8_t *key, size_t length) {
+    for (size_t i = 0; i < length; ++i)
+        if (hexNibble(key[i]) < 0) return false;
+    return true;
+}
+
+// Decodes a 64-digit hex PSK into its 32-byte PMK. Caller validated with isHexKey.
+inline void decodeHexKey(const uint8_t *key, uint8_t *out, size_t outLength) {
+    for (size_t i = 0; i < outLength; ++i)
+        out[i] = uint8_t(hexNibble(key[2 * i]) << 4 | hexNibble(key[2 * i + 1]));
+}
+
 inline LegacyAuth classifyLegacyAuth(const JoinRequest &j) {
     // Values from apple80211_authtype/cipher_type, used by the WCL association request.
     if (!validRSNOverride(j.rsn, j.rsnLength)) return LegacyAuth::Invalid;
@@ -484,12 +518,27 @@ inline LegacyAuth classifyLegacyAuth(const JoinRequest &j) {
     if (j.upperAuth == (1u << 12))
         return j.keyCipher == 10 && j.keyLength >= 1 && j.keyLength <= 63 ?
             LegacyAuth::SAE : LegacyAuth::Invalid;
-    if (j.upperAuth == (1u << 3) && j.keyCipher == 10)
-        return j.keyLength >= 8 && j.keyLength <= 63 ? LegacyAuth::PersonalPassphrase : LegacyAuth::Invalid;
     const uint32_t personal = (1u << 1) | (1u << 3) | (1u << 10);
     const uint32_t enterprise = (1u << 0) | (1u << 2) | (1u << 11);
+    const uint32_t saeBit = 1u << 12;
+    // WPA2/WPA3 transition: SAE offered together with PSK AKMs. Mixed
+    // networks use the WPA2 compatibility path, so join with the PSK AKMs.
+    if ((j.upperAuth & saeBit) && (j.upperAuth & personal) &&
+        !(j.upperAuth & ~(personal | saeBit)) && j.keyCipher == 10)
+        return j.keyLength >= 8 && j.keyLength <= 63 ?
+            LegacyAuth::PersonalPassphrase : LegacyAuth::Invalid;
     if (j.upperAuth & ~(personal | enterprise)) return LegacyAuth::Invalid;
     if ((j.upperAuth & personal) && (j.upperAuth & enterprise)) return LegacyAuth::Invalid;
+    // A passphrase is valid for any PSK AKM combination airportd selects
+    // (WPA/WPA2 mixed mode, WPA2-PSK + PSK-SHA256), not only WPA2-PSK alone.
+    // The PMK is derived locally, so the AKM set does not change the key.
+    if ((j.upperAuth & personal) && j.keyCipher == 10) {
+        if (j.keyLength >= 8 && j.keyLength <= 63)
+            return LegacyAuth::PersonalPassphrase;
+        if (j.keyLength == 64 && isHexKey(j.key, 64))
+            return LegacyAuth::PersonalHexKey;
+        return LegacyAuth::Invalid;
+    }
     if (j.upperAuth & personal)
         return j.keyLength == 32 && (j.keyCipher == 6 || j.keyCipher == 7) ?
             LegacyAuth::Personal : LegacyAuth::Invalid;
