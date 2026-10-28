@@ -6,6 +6,7 @@
 #include <net80211/ieee80211_he_policy.hpp>
 
 #include <IOKit/IOLib.h>
+#include <pexpert/pexpert.h>
 
 extern "C" {
 #include "compat/rtw88_compat.h"
@@ -336,7 +337,17 @@ bool rtw89LinuxAttach(Rtw89PciTransport *transport,
     rtw88_set_hw_callbacks(&hardwareCallbacks, context);
     activeContext = context;
     rtw88_set_tx_resume_cb(resumeTransmit);
-    rtw88_force_wifi_only();
+    {
+        /* Combo cards share the antenna between WLAN and BT. Wifi-only coex
+         * grants it to WLAN permanently, which leaves a working BT controller
+         * (e.g. RealtekBluetoothFirmware + BlueToolFixup) deaf. -rtwbtcoex
+         * keeps the normal coex policy for setups where BT is alive. */
+        int btcoex = 0;
+        if (PE_parse_boot_argn("-rtwbtcoex", &btcoex, sizeof(btcoex)))
+            RTW_LOG("AirportRTW-RTW89: -rtwbtcoex set, keeping BT coexistence enabled\n");
+        else
+            rtw88_force_wifi_only();
+    }
     memcpy(context->macAddress, hw->wiphy->perm_addr,
            sizeof(context->macAddress));
 
